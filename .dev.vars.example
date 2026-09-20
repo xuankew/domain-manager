@@ -1,0 +1,2 @@
+# 本地开发用，wrangler dev 会自动加载。不要提交真实密码。
+DISABLE_AUTH=1

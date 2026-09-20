@@ -1,0 +1,22 @@
+{
+  "name": "domain-manager",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "跨注册商的域名到期监控看板 / Cross-registrar domain expiration dashboard on Cloudflare Workers",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init:local": "wrangler d1 execute domain-manager --local --file=./schema.sql",
+    "db:init:remote": "wrangler d1 execute domain-manager --remote --file=./schema.sql --yes",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260917.1",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.134.0"
+  }
+}
