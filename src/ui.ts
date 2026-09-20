@@ -36,6 +36,8 @@ interface DashboardMeta {
   notifyConfigured: boolean;
   currency: string;
   schemaReady: boolean;
+  total: number;
+  filter: { field: 'expiry' | 'registered'; from: string; to: string; active: boolean };
 }
 
 export function renderLogin(
@@ -238,7 +240,11 @@ export function renderDashboard(views: DomainView[], meta: DashboardMeta): strin
         <div>
           <h1>域名到期看板</h1>
           <p class="muted">
-            ${stats.total} 个域名 · 数据源 RDAP / WHOIS ·
+            ${
+              meta.filter.active
+                ? `${stats.total} / ${meta.total} 个域名（已筛选）`
+                : `${stats.total} 个域名`
+            } · 数据源 RDAP / WHOIS ·
             ${meta.lastRunAt ? `上次全量刷新 ${esc(friendlyTime(meta.lastRunAt))}` : '尚未执行过定时刷新'}
             ${meta.notifyConfigured ? '' : ' · <span class="warn-text">未配置通知 Webhook</span>'}
           </p>
@@ -301,11 +307,47 @@ export function renderDashboard(views: DomainView[], meta: DashboardMeta): strin
       </section>
 
       <section class="card">
-        ${views.length ? renderTable(views, meta.csrf, meta.currency) : renderEmpty()}
+        ${meta.total ? renderFilterBar(meta.filter) : ''}
+        ${
+          views.length
+            ? renderTable(views, meta.csrf, meta.currency)
+            : meta.filter.active
+              ? renderFilteredEmpty()
+              : renderEmpty()
+        }
       </section>
     </main>
     <script>${DASHBOARD_JS}</script>`
   );
+}
+
+function renderFilterBar(filter: DashboardMeta['filter']): string {
+  return `<form class="filter-bar" method="get" action="/" aria-label="按日期区间筛选">
+      <label class="field">
+        <span>筛选字段</span>
+        <select name="field">
+          <option value="expiry"${filter.field === 'expiry' ? ' selected' : ''}>到期日</option>
+          <option value="registered"${filter.field === 'registered' ? ' selected' : ''}>注册日</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>起始</span>
+        <input type="date" name="from" value="${esc(filter.from)}">
+      </label>
+      <label class="field">
+        <span>截止</span>
+        <input type="date" name="to" value="${esc(filter.to)}">
+      </label>
+      <button class="btn" type="submit">筛选</button>
+      ${filter.active ? '<a class="btn btn-quiet" href="/">清除筛选</a>' : ''}
+    </form>`;
+}
+
+function renderFilteredEmpty(): string {
+  return `<div class="empty">
+      <p>没有符合筛选条件的域名。</p>
+      <p><a href="/">清除筛选</a></p>
+    </div>`;
 }
 
 function renderEmpty(): string {
@@ -321,6 +363,7 @@ function renderTable(views: DomainView[], csrf: string, currency: string): strin
         <tr>
           <th>域名</th>
           <th>到期日</th>
+          <th>注册日</th>
           <th class="num">剩余</th>
           <th>注册商</th>
           <th>平台</th>
@@ -352,6 +395,7 @@ function renderRow(v: DomainView, csrf: string, currency: string): string {
         ${v.last_error ? `<span class="err" title="${esc(v.last_error)}">${esc(truncate(v.last_error, 60))}</span>` : ''}
       </td>
       <td class="mono" data-label="到期日">${esc(date)}</td>
+      <td class="mono" data-label="注册日">${v.registered_at ? esc(v.registered_at.slice(0, 10)) : '—'}</td>
       <td class="num" data-label="剩余">${badge}</td>
       <td class="small" data-label="注册商">${esc(v.registrar ?? '—')}</td>
       <td class="small" data-label="平台">${esc(v.platform || '—')}</td>
@@ -368,7 +412,7 @@ function renderRow(v: DomainView, csrf: string, currency: string): string {
           ${v.auto_renew ? '开' : '关'}
         </button>
       </td>
-      <td class="small muted" data-label="上次检查">${v.checked_at ? esc(friendlyTime(v.checked_at)) : '—'}${
+      <td class="small muted nowrap" data-label="上次检查">${v.checked_at ? esc(friendlyTime(v.checked_at)) : '—'}${
         v.source ? ` · ${esc(v.source)}` : ''
       }</td>
       <td class="actions-col">
@@ -489,6 +533,11 @@ h2 { font-size: 14px; margin: 0 0 12px; font-weight: 620; }
 
 .add-form { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
 .field { display: flex; flex-direction: column; gap: 4px; min-width: 130px; }
+.filter-bar {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+  margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--border);
+}
+.filter-bar input[type='date'] { width: 150px; }
 .field > span { font-size: 12px; color: var(--muted); }
 .field-grow { flex: 1 1 180px; }
 input[type=text], input[type=password], input[type=url], input:not([type]), textarea, select {
@@ -521,14 +570,20 @@ textarea { resize: vertical; font-family: inherit; }
 table.domains { width: 100%; border-collapse: collapse; }
 table.domains th {
   text-align: left; font-size: 11.5px; font-weight: 600; color: var(--muted); text-transform: uppercase;
-  letter-spacing: .03em; padding: 0 10px 8px; border-bottom: 1px solid var(--border);
+  letter-spacing: .03em; padding: 0 10px 8px; border-bottom: 1px solid var(--border); white-space: nowrap;
 }
 table.domains td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 table.domains tbody tr:last-child td { border-bottom: none; }
 table.domains tbody tr:hover { background: var(--hover); }
 .num { text-align: right; } .center { text-align: center; }
-th.num { text-align: right; }
-.cell-domain { display: flex; flex-direction: column; gap: 1px; min-width: 180px; }
+/* 特异性要压过 table.domains th 的 text-align:left，否则数字表头会和右对齐的单元格错开 */
+table.domains th.num { text-align: right; }
+table.domains th.center { text-align: center; }
+/* td 必须保持 table-cell：display:flex 会让单元格脱离表格布局，内容顶对齐、边框画在行边框上方 */
+.cell-domain { min-width: 180px; }
+.cell-domain > span { display: block; }
+.cell-domain > span + span { margin-top: 1px; }
+td.mono, td.nowrap { white-space: nowrap; }
 .domain-name { font-weight: 550; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
 .note { font-size: 11.5px; color: var(--muted); }
 .err { font-size: 11.5px; color: var(--expired); }
@@ -606,6 +661,7 @@ th.num { text-align: right; }
   table.domains td { border: none; padding: 3px 0; display: flex; justify-content: space-between; gap: 12px; }
   table.domains td::before { content: attr(data-label); color: var(--muted); font-size: 11.5px; flex-shrink: 0; }
   .cell-domain { flex-direction: row; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .cell-domain > span + span { margin-top: 0; }
   table.domains td.actions-col { justify-content: flex-end; gap: 8px; }
 }
 `;

@@ -7,6 +7,8 @@ export interface LookupResult {
   status: LookupStatus;
   /** ISO-8601 UTC 日期，未知时为 null（部分 ccTLD 如 .de 不公开到期时间） */
   expiresAt: string | null;
+  /** 注册局记录的首次注册日期，即「购买/创建时间」；不公开时为 null */
+  registeredAt: string | null;
   registrar: string | null;
   source: LookupSource | null;
   /** 查询失败的原始信息 */

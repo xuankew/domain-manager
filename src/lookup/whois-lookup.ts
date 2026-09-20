@@ -1,5 +1,5 @@
 import { discoverWhoisServer, isWhoisNotFound, whoisQuery } from './whois';
-import { parseExpiry, parseRegistrar } from './parse';
+import { parseCreated, parseExpiry, parseRegistrar } from './parse';
 import type { Cache } from './rdap';
 import type { LookupResult } from './types';
 
@@ -85,6 +85,7 @@ export async function whoisLookup(domain: string, tld: string, cache: Cache): Pr
     return {
       status: 'error',
       expiresAt: null,
+      registeredAt: null,
       registrar: null,
       source: 'whois',
       error: err instanceof Error ? err.message : String(err),
@@ -93,16 +94,26 @@ export async function whoisLookup(domain: string, tld: string, cache: Cache): Pr
   }
 
   if (isWhoisNotFound(text)) {
-    return { status: 'notfound', expiresAt: null, registrar: null, source: 'whois', error: null, server };
+    return {
+      status: 'notfound',
+      expiresAt: null,
+      registeredAt: null,
+      registrar: null,
+      source: 'whois',
+      error: null,
+      server,
+    };
   }
 
   const expiresAt = parseExpiry(text);
+  const registeredAt = parseCreated(text);
   const registrar = parseRegistrar(text);
 
   return {
     // 有些注册局（.de / .nl）不公开到期时间，能查到记录就算成功
     status: expiresAt || registrar ? 'ok' : 'error',
     expiresAt,
+    registeredAt,
     registrar,
     source: 'whois',
     error: expiresAt || registrar ? null : '无法从 WHOIS 响应中解析出到期时间或注册商',

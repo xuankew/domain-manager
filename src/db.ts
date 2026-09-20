@@ -11,6 +11,7 @@ export interface DomainRow {
   cost: number | null;
   created_at: string;
   expires_at: string | null;
+  registered_at: string | null;
   registrar: string | null;
   source: string | null;
   checked_at: string | null;
@@ -142,6 +143,7 @@ export async function updateDomain(
 export async function saveLookup(db: D1Database, row: DomainRow, result: DomainLookup): Promise<void> {
   const checkedAt = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   const expiresAt = result.status === 'ok' ? result.expiresAt : row.expires_at;
+  const registeredAt = result.registeredAt ?? row.registered_at;
   const registrar = result.registrar ?? row.registrar;
   const lastError =
     result.status === 'ok'
@@ -154,10 +156,11 @@ export async function saveLookup(db: D1Database, row: DomainRow, result: DomainL
     .batch([
       db
         .prepare(
-          `UPDATE domains SET expires_at = ?1, registrar = ?2, source = ?3, checked_at = ?4, last_error = ?5
-           WHERE id = ?6`
+          `UPDATE domains SET expires_at = ?1, registrar = ?2, source = ?3, checked_at = ?4, last_error = ?5,
+                  registered_at = ?6
+           WHERE id = ?7`
         )
-        .bind(expiresAt, registrar, result.source, checkedAt, lastError, row.id),
+        .bind(expiresAt, registrar, result.source, checkedAt, lastError, registeredAt, row.id),
       db
         .prepare(
           `INSERT INTO checks (domain, checked_at, expires_at, registrar, source, error)
@@ -194,6 +197,34 @@ export function sortViews(views: DomainView[]): DomainView[] {
     if (a.daysLeft === null) return 1;
     if (b.daysLeft === null) return -1;
     return a.daysLeft - b.daysLeft || a.domain.localeCompare(b.domain);
+  });
+}
+
+export interface DateFilter {
+  field: 'expiry' | 'registered';
+  from: string | null;
+  to: string | null;
+}
+
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+/** 看板筛选条的查询参数；没有有效日期边界时返回 null（即不筛选） */
+export function parseDateFilter(query: Record<string, string | undefined>): DateFilter | null {
+  const from = DATE_ONLY.test(query.from ?? '') ? (query.from as string) : null;
+  const to = DATE_ONLY.test(query.to ?? '') ? (query.to as string) : null;
+  if (!from && !to) return null;
+  return { field: query.field === 'registered' ? 'registered' : 'expiry', from, to };
+}
+
+/** 区间按日历天闭区间比较；该字段为空的域名在筛选时不显示 */
+export function applyDateFilter(views: DomainView[], filter: DateFilter): DomainView[] {
+  return views.filter((v) => {
+    const raw = filter.field === 'expiry' ? v.expires_at : v.registered_at;
+    if (!raw) return false;
+    const day = raw.slice(0, 10);
+    if (filter.from && day < filter.from) return false;
+    if (filter.to && day > filter.to) return false;
+    return true;
   });
 }
 
@@ -239,6 +270,9 @@ async function upgradeSchema(db: D1Database): Promise<void> {
   // columns 为空说明还没建过表，交给 schema.sql，别在这里 ALTER
   if (columns.length && !columns.includes('cost')) {
     await db.prepare('ALTER TABLE domains ADD COLUMN cost REAL').run();
+  }
+  if (columns.length && !columns.includes('registered_at')) {
+    await db.prepare('ALTER TABLE domains ADD COLUMN registered_at TEXT').run();
   }
 }
 

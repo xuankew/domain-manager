@@ -19,6 +19,7 @@ export async function lookupDomain(rawDomain: string, cache: Cache): Promise<Dom
     return {
       status: 'error',
       expiresAt: null,
+      registeredAt: null,
       registrar: null,
       source: null,
       error: `不是合法的域名：${rawDomain}`,
@@ -35,10 +36,20 @@ export async function lookupDomain(rawDomain: string, cache: Cache): Promise<Dom
   // RDAP 查不到到期日时（部分注册局会在 RDAP 里删节该字段）用 WHOIS 补齐
   const whois = await whoisLookup(registrable, tld, cache);
   if (whois?.status === 'ok' && whois.expiresAt) {
-    return { ...whois, registrar: whois.registrar ?? rdap?.registrar ?? null, queriedDomain: registrable };
+    return {
+      ...whois,
+      registrar: whois.registrar ?? rdap?.registrar ?? null,
+      registeredAt: whois.registeredAt ?? rdap?.registeredAt ?? null,
+      queriedDomain: registrable,
+    };
   }
   if (rdap?.status === 'ok') {
-    return { ...rdap, expiresAt: whois?.expiresAt ?? null, queriedDomain: registrable };
+    return {
+      ...rdap,
+      expiresAt: whois?.expiresAt ?? null,
+      registeredAt: rdap.registeredAt ?? whois?.registeredAt ?? null,
+      queriedDomain: registrable,
+    };
   }
   if (whois?.status === 'ok') return { ...whois, queriedDomain: registrable };
 
@@ -50,6 +61,7 @@ export async function lookupDomain(rawDomain: string, cache: Cache): Promise<Dom
   return {
     status: 'error',
     expiresAt: null,
+    registeredAt: null,
     registrar: null,
     source: whois?.source ?? rdap?.source ?? null,
     error,

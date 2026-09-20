@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS domains (
   created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
   -- 最近一次检查的快照，冗余存储以便看板一次查询渲染
   expires_at    TEXT,
+  registered_at TEXT,                          -- 注册局记录的首次注册日期（购买/创建时间）
   registrar     TEXT,
   source        TEXT,                          -- rdap | whois | error
   checked_at    TEXT,

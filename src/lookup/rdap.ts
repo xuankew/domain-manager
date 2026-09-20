@@ -35,6 +35,7 @@ export async function rdapLookup(domain: string, cache: Cache): Promise<LookupRe
     return {
       status: 'notfound',
       expiresAt: null,
+      registeredAt: null,
       registrar: null,
       source: 'rdap',
       error: null,
@@ -52,6 +53,7 @@ export async function rdapLookup(domain: string, cache: Cache): Promise<LookupRe
 
   const expiresAt = extractExpiration(body);
   const registrar = extractRegistrar(body);
+  const registeredAt = extractEventDate(body, 'registration');
 
   if (!expiresAt && !registrar) {
     // RDAP 返回了对象但没有可用字段，回退 WHOIS 试试
@@ -61,6 +63,7 @@ export async function rdapLookup(domain: string, cache: Cache): Promise<LookupRe
   return {
     status: 'ok',
     expiresAt,
+    registeredAt,
     registrar,
     source: 'rdap',
     error: null,
@@ -85,8 +88,12 @@ interface RdapObject {
 }
 
 function extractExpiration(body: RdapObject): string | null {
+  return extractEventDate(body, 'expiration');
+}
+
+function extractEventDate(body: RdapObject, action: string): string | null {
   for (const ev of body.events ?? []) {
-    if (typeof ev.eventAction === 'string' && ev.eventAction.toLowerCase() === 'expiration' && ev.eventDate) {
+    if (typeof ev.eventAction === 'string' && ev.eventAction.toLowerCase() === action && ev.eventDate) {
       const iso = toIsoDate(ev.eventDate);
       if (iso) return iso;
     }

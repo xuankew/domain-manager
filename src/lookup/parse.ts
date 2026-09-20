@@ -23,6 +23,21 @@ const EXPIRY_PATTERNS: RegExp[] = [
   /Renewal Date:\s*(.+)/i,
 ];
 
+/**
+ * 首次注册日期（购买/创建时间）。顺序敏感：
+ * "Created On" 必须排在 "Created" 前面，否则短模式先命中截断值。
+ */
+const CREATED_PATTERNS: RegExp[] = [
+  /Domain Creation Date:\s*(.+)/i,
+  /Creation Date:\s*(.+)/i,
+  /Registration Date:\s*(.+)/i,
+  /Registration Time:\s*(.+)/i, // CNNIC (.cn)
+  /Registered On:\s*(.+)/i,
+  /Created On:\s*(.+)/i,
+  /Created:\s*(.+)/i,
+  /Registered:\s*(.+)/i,
+];
+
 const REGISTRAR_PATTERNS: RegExp[] = [
   /Sponsoring Registrar:\s*(.+)/i, // CNNIC (.cn)
   /Registrar Organization:\s*(.+)/i,
@@ -34,6 +49,16 @@ const REGISTRAR_PATTERNS: RegExp[] = [
 
 export function parseExpiry(text: string): string | null {
   for (const re of EXPIRY_PATTERNS) {
+    const m = text.match(re);
+    if (!m) continue;
+    const iso = toIsoDate(m[1]);
+    if (iso) return iso;
+  }
+  return null;
+}
+
+export function parseCreated(text: string): string | null {
+  for (const re of CREATED_PATTERNS) {
     const m = text.match(re);
     if (!m) continue;
     const iso = toIsoDate(m[1]);

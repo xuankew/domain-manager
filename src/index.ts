@@ -3,12 +3,14 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Env } from './env';
 import {
   addDomain,
+  applyDateFilter,
   d1Cache,
   deleteDomain,
   deleteSetting,
   getDomainByLabel,
   isSchemaReady,
   listDomains,
+  parseDateFilter,
   sortViews,
   toView,
   updateDomain,
@@ -115,7 +117,9 @@ app.get('/', async (c) => {
 
   const settings = c.get('settings');
   const rows = await listDomains(c.env.DB);
-  const views = sortViews(rows.map((r) => toView(r)));
+  const filter = parseDateFilter(c.req.query());
+  const all = sortViews(rows.map((r) => toView(r)));
+  const views = filter ? applyDateFilter(all, filter) : all;
   const lastRun = await c.env.DB.prepare('SELECT MAX(checked_at) AS t FROM checks').first<{ t: string | null }>();
 
   return c.html(
@@ -125,6 +129,13 @@ app.get('/', async (c) => {
       notifyConfigured: Boolean(settings.webhookUrl),
       currency: settings.currency,
       schemaReady: true,
+      total: all.length,
+      filter: {
+        field: filter?.field ?? 'expiry',
+        from: filter?.from ?? '',
+        to: filter?.to ?? '',
+        active: filter !== null,
+      },
     })
   );
 });
