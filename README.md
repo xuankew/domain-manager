@@ -1,5 +1,8 @@
 # domain-manager
 
+> Cross-registrar domain expiration dashboard on Cloudflare Workers.
+> One page for every domain you own, no matter which registrar sold it to you.
+
 跨注册商的域名到期监控看板，跑在 Cloudflare Workers 上。
 
 你在阿里云买了 `.cn`、在 Namecheap 买了 `.com`、在别处买了 `.dev` —— 每个平台的续费提醒
@@ -7,6 +10,8 @@
 
 **不需要任何注册商的 API 密钥。** 域名到期时间由注册局（registry）持有，与你在哪家注册商
 购买无关，因此一套 RDAP + WHOIS 查询就能覆盖所有平台。
+
+![看板截图](docs/screenshot.png)
 
 ## 功能
 
@@ -33,6 +38,7 @@
 ## 部署
 
 前置：一个 Cloudflare 账号，本地装好 Node.js（wrangler 通过 npx 调用，无需全局安装）。
+Workers 与 D1 的免费额度对个人用量足够。
 
 ```bash
 npm install
@@ -58,6 +64,9 @@ npm run deploy
 
 定时任务默认每天 UTC 03:17（北京 11:17）执行，在 `wrangler.jsonc` 的 `triggers.crons` 修改。
 
+> **克隆者注意**：仓库里 `wrangler.jsonc` 的 `database_id` 是作者自己的 D1 数据库。
+> 部署前必须先执行第 1 步并替换成你自己的 ID，否则你的 Worker 会读写作者的数据库。
+
 ## 配置
 
 Secret（`wrangler secret put <NAME>`）：
@@ -74,6 +83,36 @@ Secret（`wrangler secret put <NAME>`）：
 
 - `d1_databases[0].database_id`：换成你自己创建的 D1 数据库 ID
 - `triggers.crons`：刷新周期
+
+登录会话有效期 30 天；会话签名密钥由 `ADMIN_PASSWORD` 派生，因此改密码会让所有已登录会话失效，
+重新执行 `wrangler secret put ADMIN_PASSWORD` 即可（Secret 更新会立刻生效，无需重新部署）。
+`WEBHOOK_TYPE` 也接受 `wechat` / `lark` 作为 `wecom` / `feishu` 的别名。
+
+## HTTP API
+
+看板页面是服务端渲染的；以下 JSON 接口可供脚本或其他系统集成。
+除 `/healthz` 外都需要登录 Cookie；变更类接口（POST / PATCH）还要求请求头
+`x-requested-with: domain-manager`，表单删除接口则改用隐藏字段 `csrf`。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/healthz` | 存活与建表状态，无需登录 |
+| GET | `/api/domains` | 全部域名，含剩余天数与告警级别 |
+| POST | `/api/domains` | 添加单个域名并立即查询 |
+| POST | `/api/domains/bulk` | 批量添加，body：`{items:[{domain, platform}]}` |
+| PATCH | `/api/domains/:id` | 修改 `platform` / `note` / `autoRenew` / `notify` |
+| POST | `/api/domains/:id/refresh` | 立即重新查询单个域名 |
+| POST | `/api/domains/:id/delete` | 表单删除 |
+| POST | `/api/refresh` | 全量刷新并触发提醒判定 |
+| GET | `/api/checks/:domain` | 单个域名最近 30 次查询历史（来源、到期日、错误） |
+
+## 安全与隐私
+
+- 只查询注册局的公开数据（RDAP / WHOIS），**不存储任何注册商账号或 API 密钥**
+- 域名清单与查询历史存在你自己 Cloudflare 账号的 D1 里，不经过第三方
+- 会话用 HMAC 签名 Cookie 维持；密码与 CSRF 比较均为常量时间
+- 登录失败按 IP 限速：15 分钟内 10 次后暂时锁定
+- 变更接口要求自定义请求头，配合 `SameSite=Lax` Cookie 抵御 CSRF
 
 ## 已知限制
 
@@ -121,6 +160,14 @@ src/
   若直接按命中标签数推断可注册域，`bbc.co.uk` 会被归约成 `co.uk` —— 而 `co.uk`
   本身是 Nominet 持有的真实域名，查询会“成功”并返回完全无关的数据。
   因此 `lookup/tld.ts` 维护了一份二级公共后缀清单优先匹配。
+
+## Contributing
+
+欢迎 issue 和 PR。改动查询逻辑时请附上真实域名的验证结果
+（`GET /api/checks/:domain` 能看到每次查询的来源与原始错误）——
+各注册局的字段格式差异很大，没有实测很难判断解析是否正确。
+
+`npm run check` 跑 TypeScript 类型检查，提交前请确保通过。
 
 ## License
 
