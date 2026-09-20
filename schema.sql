@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS domains (
   note          TEXT    NOT NULL DEFAULT '',
   auto_renew    INTEGER NOT NULL DEFAULT 0,    -- 用户手动标记，仅展示用
   notify        INTEGER NOT NULL DEFAULT 1,
+  cost          REAL,                          -- 年成本，手动填写；NULL = 未填
   created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
   -- 最近一次检查的快照，冗余存储以便看板一次查询渲染
   expires_at    TEXT,
@@ -47,4 +48,14 @@ CREATE TABLE IF NOT EXISTS cache (
   key         TEXT PRIMARY KEY,
   value       TEXT NOT NULL,
   expires_at  INTEGER NOT NULL                 -- unix epoch seconds
+);
+
+-- 页面上可改的配置。Workers 的 Secret 运行时只读，所以除 DISABLE_AUTH 外
+-- 的配置都以这里为准，env Secret 仅作首次部署的引导值。
+-- admin_password 存 PBKDF2 哈希，不存明文；webhook_url 是明文（含平台 token），
+-- 界面上打码显示。
+CREATE TABLE IF NOT EXISTS settings (
+  key         TEXT PRIMARY KEY,
+  value       TEXT NOT NULL,
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );

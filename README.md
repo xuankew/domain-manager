@@ -17,7 +17,9 @@
 
 - 统一看板：剩余天数排序，已过期 / 7 天内 / 30 天内分色，暗色模式自适应
 - 数据来源：RDAP 优先（结构化、无需认证），无 RDAP 的 TLD（如 `.cn`）自动回退 WHOIS（TCP 43）
-- 网页上增删域名，支持批量导入（每行一个，可附平台标注）
+- 网页上增删域名，支持批量导入（每行一个，可附平台标注与年成本）
+- 年成本手填：表格里直接改，看板给出合计，到期提醒里带上续费金额
+- 设置页：密码、Webhook、提醒天数、币种都在页面上改，保存即生效，不用重新部署
 - 子域名自动归约：填 `blog.example.com` 会查询 `example.com`
 - 定时刷新：Cron Triggers 每天跑一次，无需自建服务器
 - 到期提醒：30 / 7 / 1 / 0 天四档，合并成一条消息投递到 Webhook
@@ -52,7 +54,7 @@ npm run db:init:remote
 # 3. 设置登录密码（必填，不设则看板拒绝所有访问）
 npx wrangler secret put ADMIN_PASSWORD
 
-# 4. 可选：到期通知
+# 4. 可选：到期通知（也可以部署后在设置页填）
 npx wrangler secret put WEBHOOK_URL
 npx wrangler secret put WEBHOOK_TYPE    # generic | dingtalk | wecom | feishu | slack
 
@@ -61,31 +63,36 @@ npm run deploy
 ```
 
 打开 `https://<你的 worker>.workers.dev`，用设置的密码登录，添加域名即可。
+第 3、4 步的 Secret 只是**首次部署的引导值**：登录后在「设置」页保存一次，配置就迁到
+D1，之后以页面上的值为准（密码只存 PBKDF2 哈希）。
 
 定时任务默认每天 UTC 03:17（北京 11:17）执行，在 `wrangler.jsonc` 的 `triggers.crons` 修改。
 
 > **克隆者注意**：仓库里 `wrangler.jsonc` 的 `database_id` 是作者自己的 D1 数据库。
 > 部署前必须先执行第 1 步并替换成你自己的 ID，否则你的 Worker 会读写作者的数据库。
 
+> **从旧版本升级**：不需要手动迁移。新版会在首个请求里自动给 `domains` 补 `cost` 列、
+> 建 `settings` 表；已有的域名与查询历史不受影响。
+
 ## 配置
 
-Secret（`wrangler secret put <NAME>`）：
+Secret（`wrangler secret put <NAME>`）只是引导值，页面上保存过就以 D1 为准：
 
 | 名称 | 必填 | 说明 |
 | --- | --- | --- |
-| `ADMIN_PASSWORD` | 是 | 看板登录密码 |
+| `ADMIN_PASSWORD` | 是 | 看板登录密码；在设置页改密码后此 Secret 不再参与校验 |
 | `WEBHOOK_URL` | 否 | 到期通知接收地址 |
 | `WEBHOOK_TYPE` | 否 | `generic`（默认）/ `dingtalk` / `wecom` / `feishu` / `slack` |
 | `NOTIFY_DAYS` | 否 | 提醒阈值，逗号分隔，默认 `30,7,1,0` |
-| `DISABLE_AUTH` | 否 | 设为 `1` 关闭鉴权，仅本地调试用 |
+| `DISABLE_AUTH` | 否 | 设为 `1` 关闭鉴权，仅本地调试用，**不在设置页暴露** |
 
 `wrangler.jsonc`：
 
 - `d1_databases[0].database_id`：换成你自己创建的 D1 数据库 ID
 - `triggers.crons`：刷新周期
 
-登录会话有效期 30 天；会话签名密钥由 `ADMIN_PASSWORD` 派生，因此改密码会让所有已登录会话失效，
-重新执行 `wrangler secret put ADMIN_PASSWORD` 即可（Secret 更新会立刻生效，无需重新部署）。
+设置页（登录后右上角「设置」）可改：Webhook 地址与消息格式、提醒天数、币种、登录密码。
+保存立即生效，无需重新部署。改密码需要再输一次当前密码，且会让所有已登录会话失效；
 `WEBHOOK_TYPE` 也接受 `wechat` / `lark` 作为 `wecom` / `feishu` 的别名。
 
 ## HTTP API
@@ -97,19 +104,23 @@ Secret（`wrangler secret put <NAME>`）：
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/healthz` | 存活与建表状态，无需登录 |
-| GET | `/api/domains` | 全部域名，含剩余天数与告警级别 |
-| POST | `/api/domains` | 添加单个域名并立即查询 |
-| POST | `/api/domains/bulk` | 批量添加，body：`{items:[{domain, platform}]}` |
-| PATCH | `/api/domains/:id` | 修改 `platform` / `note` / `autoRenew` / `notify` |
+| GET | `/api/domains` | 全部域名，含剩余天数、告警级别与年成本 |
+| POST | `/api/domains` | 添加单个域名并立即查询，body 可带 `cost` |
+| POST | `/api/domains/bulk` | 批量添加，body：`{items:[{domain, platform, cost}]}` |
+| PATCH | `/api/domains/:id` | 修改 `platform` / `note` / `autoRenew` / `notify` / `cost` |
 | POST | `/api/domains/:id/refresh` | 立即重新查询单个域名 |
 | POST | `/api/domains/:id/delete` | 表单删除 |
 | POST | `/api/refresh` | 全量刷新并触发提醒判定 |
+| POST | `/api/settings` | 表单保存设置（密码 / Webhook / 提醒天数 / 币种） |
 | GET | `/api/checks/:domain` | 单个域名最近 30 次查询历史（来源、到期日、错误） |
 
 ## 安全与隐私
 
 - 只查询注册局的公开数据（RDAP / WHOIS），**不存储任何注册商账号或 API 密钥**
-- 域名清单与查询历史存在你自己 Cloudflare 账号的 D1 里，不经过第三方
+- 域名清单、查询历史与设置都存在你自己 Cloudflare 账号的 D1 里，不经过第三方
+- 密码在 D1 里只存 PBKDF2-SHA256 哈希（随机盐、10 万迭代），不存明文；
+  会话签名与 CSRF token 由该哈希派生，改密码即让所有会话失效
+- Webhook 地址（含平台 token）在 D1 中是明文，界面上打码显示——这是「页面上可改」的代价
 - 会话用 HMAC 签名 Cookie 维持；密码与 CSRF 比较均为常量时间
 - 登录失败按 IP 限速：15 分钟内 10 次后暂时锁定
 - 变更接口要求自定义请求头，配合 `SameSite=Lax` Cookie 抵御 CSRF
@@ -137,8 +148,10 @@ npm run dev             # http://localhost:8787
 ```
 src/
 ├── index.ts            Hono 路由、鉴权中间件、Cron 入口
-├── db.ts               D1 读写、看板视图模型（剩余天数 / 告警级别）
-├── auth.ts             HMAC 签名 Cookie、登录限速
+├── db.ts               D1 读写、看板视图模型（剩余天数 / 告警级别）、旧库自动补列
+├── auth.ts             HMAC 签名 Cookie、PBKDF2 密码哈希、登录限速
+├── settings.ts         设置读取层：D1 优先、env Secret 兜底
+├── cost.ts             年成本输入校验与合计
 ├── scheduler.ts        全量刷新、提醒阈值判定与去重
 ├── notify.ts           Webhook 适配器
 ├── ui.ts               服务端渲染的看板 HTML/CSS/JS（无前端构建步骤）
@@ -160,6 +173,9 @@ src/
   若直接按命中标签数推断可注册域，`bbc.co.uk` 会被归约成 `co.uk` —— 而 `co.uk`
   本身是 Nominet 持有的真实域名，查询会“成功”并返回完全无关的数据。
   因此 `lookup/tld.ts` 维护了一份二级公共后缀清单优先匹配。
+- **Workers 的 Secret 运行时只读**，代码无法把页面上填的密码写回 `env.ADMIN_PASSWORD`。
+  所以设置页的数据落在 D1 的 `settings` 表，env Secret 只作首次部署的引导值；
+  密码存 PBKDF2 哈希，会话签名密钥由该哈希派生，从而保留「改密码即踢掉所有会话」。
 
 ## Contributing
 

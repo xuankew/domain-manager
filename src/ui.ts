@@ -1,4 +1,13 @@
 import type { DomainView } from './db';
+import { summarizeCost, type CostSummary } from './cost';
+import {
+  CURRENCIES,
+  currencySymbol,
+  formatMoney,
+  WEBHOOK_TYPES,
+  type AppSettings,
+  type PasswordMode,
+} from './settings';
 
 export function esc(s: unknown): string {
   return String(s ?? '')
@@ -25,10 +34,16 @@ interface DashboardMeta {
   csrf: string;
   lastRunAt: string | null;
   notifyConfigured: boolean;
+  currency: string;
   schemaReady: boolean;
 }
 
-export function renderLogin(csrf: string, error: string | null, passwordMissing: boolean): string {
+export function renderLogin(
+  csrf: string,
+  error: string | null,
+  passwordMissing: boolean,
+  notice: string | null = null
+): string {
   return layout(
     '登录',
     `
@@ -36,6 +51,7 @@ export function renderLogin(csrf: string, error: string | null, passwordMissing:
       <form class="card login-card" method="post" action="/login">
         <h1>域名到期看板</h1>
         <p class="muted">跨注册商统一监控域名到期时间</p>
+        ${notice ? `<div class="alert alert-notice">${esc(notice)}</div>` : ''}
         ${error ? `<div class="alert alert-error">${esc(error)}</div>` : ''}
         ${
           passwordMissing
@@ -66,8 +82,154 @@ export function renderSetupNeeded(): string {
   );
 }
 
+export interface SettingsMeta {
+  settings: AppSettings;
+  mode: PasswordMode;
+  csrf: string;
+  error: string | null;
+  saved: boolean;
+}
+
+const WEBHOOK_TYPE_LABELS: Record<string, string> = {
+  generic: '通用 JSON（n8n / ntfy / 自建）',
+  dingtalk: '钉钉群机器人',
+  wecom: '企业微信群机器人',
+  feishu: '飞书自定义机器人',
+  slack: 'Slack Incoming Webhook',
+};
+
+/** Webhook 地址里带平台 token，页面上只留个可辨认的尾巴 */
+function maskUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}/…${(u.pathname + u.search).slice(-4)}`;
+  } catch {
+    return `${url.slice(0, 8)}…`;
+  }
+}
+
+export function renderSettings(meta: SettingsMeta): string {
+  const { settings, mode, csrf, error, saved } = meta;
+  const days = settings.thresholds.join(',');
+
+  return layout(
+    '设置',
+    `<main class="wrap wrap-narrow">
+      <header class="topbar">
+        <div>
+          <h1>设置</h1>
+          <p class="muted">配置存在你自己的 D1 里，保存后立即生效，不用重新部署</p>
+        </div>
+        <a class="btn" href="/">返回看板</a>
+      </header>
+
+      ${saved ? '<div class="alert alert-notice">已保存</div>' : ''}
+      ${error ? `<div class="alert alert-error">${esc(error)}</div>` : ''}
+
+      <form method="post" action="/api/settings" class="card" autocomplete="off">
+        <input type="hidden" name="csrf" value="${esc(csrf)}">
+
+        <h2>到期通知</h2>
+        <div class="settings-grid">
+          <label class="field field-wide">
+            <span>Webhook 地址</span>
+            <input name="webhook_url" type="url" inputmode="url" placeholder="${
+              settings.webhookUrl ? '留空表示不修改' : 'https://oapi.dingtalk.com/robot/send?access_token=…'
+            }">
+            <span class="field-hint">
+              ${
+                settings.webhookUrl
+                  ? `当前：<code>${esc(maskUrl(settings.webhookUrl))}</code>（含平台 token，故打码显示）`
+                  : '未配置，到期不会推送'
+              }
+            </span>
+          </label>
+          ${
+            settings.webhookUrl
+              ? `<label class="checkbox checkbox-danger">
+            <input type="checkbox" name="webhook_clear" value="1"> 清除已保存的 Webhook 地址
+          </label>`
+              : ''
+          }
+          <label class="field">
+            <span>消息格式</span>
+            <select name="webhook_type">
+              ${WEBHOOK_TYPES.map(
+                (t) =>
+                  `<option value="${esc(t)}"${settings.webhookType === t ? ' selected' : ''}>${esc(
+                    WEBHOOK_TYPE_LABELS[t] ?? t
+                  )}</option>`
+              ).join('')}
+            </select>
+          </label>
+          <label class="field">
+            <span>提醒天数</span>
+            <input name="notify_days" value="${esc(days)}" placeholder="30,7,1,0">
+            <span class="field-hint">逗号分隔，到期前多少天各提醒一次；同一到期日同一档只发一次</span>
+          </label>
+        </div>
+
+        <div class="settings-section">
+          <h2>成本</h2>
+          <div class="settings-grid">
+            <label class="field">
+              <span>币种</span>
+              <select name="currency">
+                ${CURRENCIES.map(
+                  (code) =>
+                    `<option value="${esc(code)}"${settings.currency === code ? ' selected' : ''}>${esc(
+                      code
+                    )}</option>`
+                ).join('')}
+              </select>
+              <span class="field-hint">看板合计与提醒金额都用这个币种；金额本身在域名列表里逐个填</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h2>登录密码</h2>
+          <div class="alert alert-hint">
+            ${
+              mode === 'env'
+                ? '当前密码来自 <code>ADMIN_PASSWORD</code> Secret。在这里保存一次即迁移到数据库（只存 PBKDF2 哈希，不存明文），之后以数据库为准。'
+                : mode === 'db'
+                  ? '密码以 PBKDF2 哈希存在你的 D1 里，不存明文。'
+                  : '尚未设置密码，看板目前拒绝所有访问。'
+            }
+            改密码后所有已登录会话会失效，需要重新登录。
+          </div>
+          <div class="settings-grid">
+            ${
+              mode === 'none'
+                ? ''
+                : `<label class="field field-wide">
+              <span>当前密码</span>
+              <input name="current_password" type="password" autocomplete="current-password" placeholder="改密码时必填">
+            </label>`
+            }
+            <label class="field">
+              <span>新密码</span>
+              <input name="new_password" type="password" autocomplete="new-password" minlength="8" placeholder="至少 8 位，留空表示不改">
+            </label>
+            <label class="field">
+              <span>确认新密码</span>
+              <input name="confirm_password" type="password" autocomplete="new-password" minlength="8">
+            </label>
+          </div>
+        </div>
+
+        <div class="settings-actions">
+          <button class="btn btn-primary" type="submit">保存</button>
+        </div>
+      </form>
+    </main>`
+  );
+}
+
 export function renderDashboard(views: DomainView[], meta: DashboardMeta): string {
   const stats = summarize(views);
+  const cost = summarizeCost(views);
 
   return layout(
     '域名到期看板',
@@ -83,6 +245,7 @@ export function renderDashboard(views: DomainView[], meta: DashboardMeta): strin
         </div>
         <div class="topbar-actions">
           <button class="btn" id="refresh-all" ${stats.total ? '' : 'disabled'}>刷新全部</button>
+          <a class="btn" href="/settings">设置</a>
           <form method="post" action="/logout" class="inline">
             <input type="hidden" name="csrf" value="${esc(meta.csrf)}">
             <button class="btn btn-quiet" type="submit">退出</button>
@@ -96,6 +259,7 @@ export function renderDashboard(views: DomainView[], meta: DashboardMeta): strin
         ${statCard('warn', '30 天内', stats.warn)}
         ${statCard('ok', '正常', stats.ok)}
         ${statCard('unknown', '未知 / 失败', stats.unknown)}
+        ${costCard(cost, meta.currency)}
       </section>
 
       <section class="card add-card">
@@ -112,6 +276,10 @@ export function renderDashboard(views: DomainView[], meta: DashboardMeta): strin
           <datalist id="platform-list">
             ${PLATFORM_SUGGESTIONS.map((p) => `<option value="${esc(p)}">`).join('')}
           </datalist>
+          <label class="field">
+            <span>年成本（${esc(meta.currency)}）</span>
+            <input name="cost" type="number" min="0" step="0.01" inputmode="decimal" placeholder="68">
+          </label>
           <label class="field field-grow">
             <span>备注</span>
             <input name="note" placeholder="可选">
@@ -124,7 +292,8 @@ export function renderDashboard(views: DomainView[], meta: DashboardMeta): strin
         <details class="bulk">
           <summary>批量导入</summary>
           <form id="bulk-form">
-            <textarea name="domains" rows="5" placeholder="每行一个域名，可用空格或逗号附上平台标注：&#10;example.com 阿里云&#10;foo.dev Namecheap"></textarea>
+            <textarea name="domains" rows="5" placeholder="每行一个域名，可用空格或逗号附上平台标注与年成本：&#10;example.com 阿里云 68&#10;foo.dev Namecheap 9.98"></textarea>
+            <p class="muted">第三段是纯数字时按年成本（${esc(meta.currency)}）解析，否则并入平台名。</p>
             <button class="btn" type="submit">导入</button>
           </form>
         </details>
@@ -132,7 +301,7 @@ export function renderDashboard(views: DomainView[], meta: DashboardMeta): strin
       </section>
 
       <section class="card">
-        ${views.length ? renderTable(views, meta.csrf) : renderEmpty()}
+        ${views.length ? renderTable(views, meta.csrf, meta.currency) : renderEmpty()}
       </section>
     </main>
     <script>${DASHBOARD_JS}</script>`
@@ -146,7 +315,7 @@ function renderEmpty(): string {
     </div>`;
 }
 
-function renderTable(views: DomainView[], csrf: string): string {
+function renderTable(views: DomainView[], csrf: string, currency: string): string {
   return `<table class="domains">
       <thead>
         <tr>
@@ -155,18 +324,19 @@ function renderTable(views: DomainView[], csrf: string): string {
           <th class="num">剩余</th>
           <th>注册商</th>
           <th>平台</th>
+          <th class="num">年成本</th>
           <th class="center">自动续费</th>
           <th>上次检查</th>
           <th class="actions-col"></th>
         </tr>
       </thead>
       <tbody>
-        ${views.map((v) => renderRow(v, csrf)).join('')}
+        ${views.map((v) => renderRow(v, csrf, currency)).join('')}
       </tbody>
     </table>`;
 }
 
-function renderRow(v: DomainView, csrf: string): string {
+function renderRow(v: DomainView, csrf: string, currency: string): string {
   const date = v.expires_at ? v.expires_at.slice(0, 10) : '—';
   const badge =
     v.daysLeft === null
@@ -176,22 +346,29 @@ function renderRow(v: DomainView, csrf: string): string {
         }</span>`;
 
   return `<tr data-id="${v.id}" data-domain="${esc(v.domain)}" class="row-${v.level}">
-      <td class="cell-domain">
+      <td class="cell-domain" data-label="域名">
         <span class="domain-name">${esc(v.domain)}</span>
         ${v.note ? `<span class="note">${esc(v.note)}</span>` : ''}
         ${v.last_error ? `<span class="err" title="${esc(v.last_error)}">${esc(truncate(v.last_error, 60))}</span>` : ''}
       </td>
-      <td class="mono">${esc(date)}</td>
-      <td class="num">${badge}</td>
-      <td class="small">${esc(v.registrar ?? '—')}</td>
-      <td class="small">${esc(v.platform || '—')}</td>
-      <td class="center">
+      <td class="mono" data-label="到期日">${esc(date)}</td>
+      <td class="num" data-label="剩余">${badge}</td>
+      <td class="small" data-label="注册商">${esc(v.registrar ?? '—')}</td>
+      <td class="small" data-label="平台">${esc(v.platform || '—')}</td>
+      <td class="num cell-cost" data-label="年成本">
+        <input class="cost-input" type="number" min="0" step="0.01" inputmode="decimal"
+               data-action="cost" data-id="${v.id}" data-currency="${esc(currency)}"
+               value="${v.cost === null ? '' : esc(v.cost)}" placeholder="—"
+               title="年成本（${esc(currency)}），回车或移开焦点即保存"
+               aria-label="${esc(v.domain)} 的年成本">
+      </td>
+      <td class="center" data-label="自动续费">
         <button class="toggle ${v.auto_renew ? 'on' : ''}" data-action="toggle-renew" data-id="${v.id}"
                 title="点击切换自动续费标记（仅记录，不会真的去注册商开启）" aria-pressed="${v.auto_renew ? 'true' : 'false'}">
           ${v.auto_renew ? '开' : '关'}
         </button>
       </td>
-      <td class="small muted">${v.checked_at ? esc(friendlyTime(v.checked_at)) : '—'}${
+      <td class="small muted" data-label="上次检查">${v.checked_at ? esc(friendlyTime(v.checked_at)) : '—'}${
         v.source ? ` · ${esc(v.source)}` : ''
       }</td>
       <td class="actions-col">
@@ -218,6 +395,17 @@ function statCard(level: string, label: string, count: number): string {
   return `<div class="stat stat-${level}">
       <span class="stat-num">${count}</span>
       <span class="stat-label">${esc(label)}</span>
+    </div>`;
+}
+
+function costCard(cost: CostSummary, currency: string): string {
+  const total = cost.filled ? formatMoney(cost.total, currency) : '—';
+  const detail = cost.filled
+    ? `已填 ${cost.filled} 个${cost.missing ? ` / 共 ${cost.filled + cost.missing} 个` : ''}`
+    : '在下方表格里直接填';
+  return `<div class="stat stat-cost" data-symbol="${esc(currencySymbol(currency))}">
+      <span class="stat-num stat-num-sm">${esc(total)}</span>
+      <span class="stat-label">年成本合计 · ${esc(detail)}</span>
     </div>`;
 }
 
@@ -303,11 +491,11 @@ h2 { font-size: 14px; margin: 0 0 12px; font-weight: 620; }
 .field { display: flex; flex-direction: column; gap: 4px; min-width: 130px; }
 .field > span { font-size: 12px; color: var(--muted); }
 .field-grow { flex: 1 1 180px; }
-input[type=text], input[type=password], input:not([type]), textarea {
+input[type=text], input[type=password], input[type=url], input:not([type]), textarea, select {
   font: inherit; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px;
   background: var(--bg); color: var(--text); width: 100%;
 }
-input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
 textarea { resize: vertical; font-family: inherit; }
 .checkbox { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); padding-bottom: 8px; white-space: nowrap; }
 .bulk { margin-top: 12px; }
@@ -384,6 +572,32 @@ th.num { text-align: right; }
 .login-card .btn { width: 100%; }
 .inline { display: inline; }
 
+.stat-cost { border-left-color: var(--accent); }
+.stat-num-sm { font-size: 17px; line-height: 1.5; }
+
+/* 成本是表格里唯一可直接编辑的单元格：平时不像输入框，hover / focus 才显形 */
+.cell-cost { white-space: nowrap; }
+.cost-input {
+  width: 92px; font: inherit; font-size: 12.5px; padding: 3px 6px; text-align: right;
+  border: 1px solid transparent; border-radius: 5px; background: transparent; color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.cost-input:hover { border-color: var(--border); background: var(--bg); }
+.cost-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); background: var(--bg); }
+.cost-input.saved { border-color: color-mix(in srgb, var(--ok) 55%, transparent); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.cost-input.failed { border-color: var(--expired); background: color-mix(in srgb, var(--expired) 10%, transparent); }
+
+.wrap-narrow { max-width: 760px; }
+.settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; align-items: start; }
+.field-wide { grid-column: 1 / -1; }
+.field > .field-hint { font-size: 11.5px; line-height: 1.45; }
+.field-hint code { font-size: 11px; }
+.settings-section { border-top: 1px solid var(--border); margin-top: 18px; padding-top: 16px; }
+.settings-actions { margin-top: 20px; display: flex; justify-content: flex-end; }
+.checkbox-danger { color: var(--muted); font-size: 12.5px; align-self: end; }
+.alert-notice { background: color-mix(in srgb, var(--ok) 12%, transparent); color: var(--ok); }
+.alert-hint { background: var(--bg); border: 1px solid var(--border); color: var(--muted); font-size: 12.5px; }
+
 @media (max-width: 760px) {
   .wrap { padding: 16px 12px 48px; }
   table.domains thead { display: none; }
@@ -396,20 +610,7 @@ th.num { text-align: right; }
 }
 `;
 
-/** 移动端把表格转成卡片后，用 data-label 补回列名 */
-const MOBILE_LABELS = `
-(function () {
-  var labels = ['域名', '到期日', '剩余', '注册商', '平台', '自动续费', '上次检查', ''];
-  document.querySelectorAll('table.domains tbody tr').forEach(function (tr) {
-    tr.querySelectorAll('td').forEach(function (td, i) {
-      if (labels[i]) td.setAttribute('data-label', labels[i]);
-    });
-  });
-})();
-`;
-
 const DASHBOARD_JS = `
-${MOBILE_LABELS}
 (function () {
   var status = document.getElementById('add-status');
 
@@ -440,7 +641,7 @@ ${MOBILE_LABELS}
       method: 'POST',
       body: JSON.stringify({
         domain: fd.get('domain'), platform: fd.get('platform'),
-        note: fd.get('note'), autoRenew: !!fd.get('autoRenew')
+        note: fd.get('note'), autoRenew: !!fd.get('autoRenew'), cost: fd.get('cost')
       })
     }).then(function (res) {
       if (res.warning) setStatus(res.warning, 'err');
@@ -458,7 +659,13 @@ ${MOBILE_LABELS}
     var raw = bulkForm.querySelector('textarea').value;
     var items = raw.split(/[\\r\\n]+/).map(function (l) { return l.trim(); }).filter(Boolean).map(function (line) {
       var parts = line.split(/[\\s,]+/);
-      return { domain: parts[0], platform: parts.slice(1).join(' ') };
+      var cost = null;
+      var last = parts[parts.length - 1];
+      if (parts.length > 2 && /^\\d+(\\.\\d+)?$/.test(last)) {
+        cost = last;
+        parts = parts.slice(0, -1);
+      }
+      return { domain: parts[0], platform: parts.slice(1).join(' '), cost: cost };
     });
     if (!items.length) { setStatus('没有可导入的域名', 'err'); return; }
     setStatus('导入 ' + items.length + ' 个域名…');
@@ -494,6 +701,56 @@ ${MOBILE_LABELS}
         .catch(function (err) { alert(err.message); })
         .finally(function () { btn.disabled = false; });
     }
+  });
+
+  function money(amount, symbol) {
+    var fixed = (Math.round(amount * 100) / 100).toFixed(2).replace(/\\.00$/, '');
+    var parts = fixed.split('.');
+    parts[0] = parts[0].replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
+    return symbol + parts.join('.');
+  }
+
+  /** 成本改完就地更新合计卡片，不必整页刷新 */
+  function updateCostTotal() {
+    var card = document.querySelector('.stat-cost');
+    if (!card) return;
+    var symbol = card.getAttribute('data-symbol') || '';
+    var inputs = document.querySelectorAll('.cost-input');
+    var total = 0, filled = 0;
+    inputs.forEach(function (input) {
+      var value = parseFloat(input.value);
+      if (isFinite(value)) { total += value; filled++; }
+    });
+    card.querySelector('.stat-num').textContent = filled ? money(total, symbol) : '—';
+    card.querySelector('.stat-label').textContent = '年成本合计 · ' + (filled
+      ? '已填 ' + filled + ' 个' + (inputs.length - filled ? ' / 共 ' + inputs.length + ' 个' : '')
+      : '在下方表格里直接填');
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter') return;
+    var input = e.target.closest('[data-action="cost"]');
+    if (!input) return;
+    e.preventDefault();
+    input.blur(); // 触发 change，走统一的保存路径
+  });
+
+  document.addEventListener('change', function (e) {
+    var input = e.target.closest('[data-action="cost"]');
+    if (!input) return;
+
+    input.classList.remove('saved', 'failed');
+    api('/api/domains/' + input.getAttribute('data-id'), {
+      method: 'PATCH',
+      body: JSON.stringify({ cost: input.value.trim() })
+    }).then(function () {
+      input.classList.add('saved');
+      updateCostTotal();
+      setTimeout(function () { input.classList.remove('saved'); }, 1200);
+    }).catch(function (err) {
+      input.classList.add('failed');
+      alert(err.message);
+    });
   });
 
   document.querySelectorAll('form[data-confirm]').forEach(function (form) {

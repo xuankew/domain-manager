@@ -62,6 +62,54 @@ export function timingSafeEqualStr(a: string, b: string): boolean {
   return crypto.subtle.timingSafeEqual(ab as unknown as BufferSource, bb as unknown as BufferSource);
 }
 
+/**
+ * 密码存 D1 时只存 PBKDF2 哈希。Secret 运行时只读，页面上改密码必须落库，
+ * 但库里也不该出现明文，所以走「随机盐 + 高迭代」的单向哈希。
+ * 格式：pbkdf2$<iterations>$<saltB64Url>$<hashB64Url>
+ */
+const PBKDF2_ITERATIONS = 100_000;
+const PBKDF2_BITS = 256;
+
+async function pbkdf2Bits(password: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: salt as unknown as BufferSource, iterations, hash: 'SHA-256' },
+    key,
+    PBKDF2_BITS
+  );
+  return new Uint8Array(bits);
+}
+
+export async function hashPassword(password: string): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2Bits(password, salt, PBKDF2_ITERATIONS);
+  return `pbkdf2$${PBKDF2_ITERATIONS}$${toBase64Url(salt)}$${toBase64Url(hash)}`;
+}
+
+export async function verifyPasswordHash(stored: string, password: string): Promise<boolean> {
+  const [scheme, iterationsRaw, saltRaw, hashRaw] = stored.split('$');
+  if (scheme !== 'pbkdf2' || !saltRaw || !hashRaw) return false;
+
+  const iterations = Number(iterationsRaw);
+  if (!Number.isInteger(iterations) || iterations < 1) return false;
+
+  let salt: Uint8Array;
+  let expected: Uint8Array;
+  try {
+    salt = fromBase64Url(saltRaw);
+    expected = fromBase64Url(hashRaw);
+  } catch {
+    return false;
+  }
+  if (expected.length * 8 !== PBKDF2_BITS) return false;
+
+  const actual = await pbkdf2Bits(password, salt, iterations);
+  return crypto.subtle.timingSafeEqual(
+    actual as unknown as BufferSource,
+    expected as unknown as BufferSource
+  );
+}
+
 export function sessionCookie(token: string): string {
   const attrs = [
     `${COOKIE_NAME}=${token}`,

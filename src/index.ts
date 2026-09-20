@@ -1,15 +1,18 @@
 import { Hono } from 'hono';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Env } from './env';
 import {
   addDomain,
   d1Cache,
   deleteDomain,
+  deleteSetting,
   getDomainByLabel,
   isSchemaReady,
   listDomains,
   sortViews,
   toView,
   updateDomain,
+  writeSetting,
 } from './db';
 import { normalizeDomain } from './lookup/domain';
 import { refreshAll, refreshDomain } from './scheduler';
@@ -17,14 +20,25 @@ import {
   clearCookie,
   CSRF_HEADER,
   CSRF_HEADER_VALUE,
+  hashPassword,
   issueSession,
   readSessionCookie,
   timingSafeEqualStr,
   verifySession,
 } from './auth';
-import { esc, renderDashboard, renderLogin, renderSetupNeeded } from './ui';
+import {
+  loadSettings,
+  normalizeCurrency,
+  normalizeWebhookType,
+  passwordMode,
+  signingMaterial,
+  verifyPassword,
+  type AppSettings,
+} from './settings';
+import { esc, renderDashboard, renderLogin, renderSettings, renderSetupNeeded } from './ui';
+import { parseCostInput } from './cost';
 
-const app = new Hono<{ Bindings: Env }>();
+const app = new Hono<{ Bindings: Env; Variables: { settings: AppSettings } }>();
 
 const MAX_LOGIN_ATTEMPTS = 10;
 const LOGIN_WINDOW_SECONDS = 900;
@@ -35,17 +49,21 @@ app.get('/healthz', async (c) => {
 });
 
 app.get('/login', async (c) => {
-  if (!c.env.ADMIN_PASSWORD) return c.html(renderLogin('', null, true), 200);
-  return c.html(renderLogin(await csrfToken(c.env), null, false));
+  const settings = await loadSettings(c.env);
+  if (passwordMode(settings) === 'none') return c.html(renderLogin('', null, true), 200);
+
+  const notice = c.req.query('reset') ? '密码已更新，请用新密码登录' : null;
+  return c.html(renderLogin(await csrfToken(signingMaterial(settings)), null, false, notice));
 });
 
 app.post('/login', async (c) => {
-  const password = c.env.ADMIN_PASSWORD;
-  if (!password) return c.html(renderLogin('', null, true), 503);
+  const settings = await loadSettings(c.env);
+  const material = signingMaterial(settings);
+  if (!material) return c.html(renderLogin('', null, true), 503);
 
   const ip = c.req.header('cf-connecting-ip') ?? 'unknown';
   const cache = d1Cache(c.env.DB);
-  const token = await csrfToken(c.env);
+  const token = await csrfToken(material);
   if (await isLoginBlocked(cache, ip)) {
     return c.html(renderLogin(token, '尝试次数过多，请 15 分钟后再试', false), 429);
   }
@@ -53,14 +71,15 @@ app.post('/login', async (c) => {
   const form = await c.req.parseBody();
   const submitted = String(form.password ?? '');
 
-  if (!timingSafeEqualStr(String(form.csrf ?? ''), token) || !timingSafeEqualStr(submitted, password)) {
+  // 先比 CSRF 再跑 PBKDF2，避免被跨站请求白嫖一轮哈希计算
+  if (!timingSafeEqualStr(String(form.csrf ?? ''), token) || !(await verifyPassword(settings, submitted))) {
     await recordLoginFailure(cache, ip);
     return c.html(renderLogin(token, '密码错误', false), 401);
   }
 
   await clearLoginFailures(cache, ip);
   const isSecure = new URL(c.req.url).protocol === 'https:';
-  c.header('Set-Cookie', await issueSession(password, isSecure));
+  c.header('Set-Cookie', await issueSession(material, isSecure));
   return c.redirect('/', 302);
 });
 
@@ -74,12 +93,16 @@ app.post('/logout', (c) => {
  * Hono 的中间件只对注册在其之后的路由生效，/healthz、/login、/logout 已在上面注册，天然跳过。
  */
 app.use('*', async (c, next) => {
+  const settings = await loadSettings(c.env);
+  c.set('settings', settings);
   if (c.env.DISABLE_AUTH === '1') return next();
 
-  const password = c.env.ADMIN_PASSWORD;
-  if (!password) return c.text('未配置 ADMIN_PASSWORD，看板已禁用。执行 wrangler secret put ADMIN_PASSWORD', 503);
+  const material = signingMaterial(settings);
+  if (!material) {
+    return c.text('未配置登录密码，看板已禁用。执行 wrangler secret put ADMIN_PASSWORD', 503);
+  }
 
-  const ok = await verifySession(readSessionCookie(c.req.header('cookie')), password);
+  const ok = await verifySession(readSessionCookie(c.req.header('cookie')), material);
   if (!ok) {
     if (c.req.path.startsWith('/api/')) return c.json({ error: '未登录或会话已过期' }, 401);
     return c.redirect('/login', 302);
@@ -90,18 +113,107 @@ app.use('*', async (c, next) => {
 app.get('/', async (c) => {
   if (!(await isSchemaReady(c.env.DB))) return c.html(renderSetupNeeded(), 503);
 
+  const settings = c.get('settings');
   const rows = await listDomains(c.env.DB);
   const views = sortViews(rows.map((r) => toView(r)));
   const lastRun = await c.env.DB.prepare('SELECT MAX(checked_at) AS t FROM checks').first<{ t: string | null }>();
 
   return c.html(
     renderDashboard(views, {
-      csrf: await csrfToken(c.env),
+      csrf: await csrfToken(signingMaterial(settings)),
       lastRunAt: lastRun?.t ?? null,
-      notifyConfigured: Boolean(c.env.WEBHOOK_URL?.trim()),
+      notifyConfigured: Boolean(settings.webhookUrl),
+      currency: settings.currency,
       schemaReady: true,
     })
   );
+});
+
+app.get('/settings', async (c) => {
+  const settings = c.get('settings');
+  return c.html(
+    renderSettings({
+      settings,
+      mode: passwordMode(settings),
+      csrf: await csrfToken(signingMaterial(settings)),
+      error: null,
+      saved: c.req.query('saved') === '1',
+    })
+  );
+});
+
+/** 表单提交（非 fetch），所以用 csrf 隐藏字段而不是自定义请求头 */
+app.post('/api/settings', async (c) => {
+  const settings = c.get('settings');
+  const material = signingMaterial(settings);
+  const token = await csrfToken(material);
+  const form = await c.req.parseBody();
+  const str = (key: string) => String(form[key] ?? '').trim();
+
+  const fail = (error: string, status: ContentfulStatusCode = 400) =>
+    c.html(renderSettings({ settings, mode: passwordMode(settings), csrf: token, error, saved: false }), status);
+
+  if (!timingSafeEqualStr(str('csrf'), token)) return fail('CSRF 校验失败', 403);
+
+  const db = c.env.DB;
+  // 只写提交上来的字段：表单里没出现的配置保持原样，避免局部提交把其他项重置成默认值
+  if (form.currency !== undefined) await writeSetting(db, 'currency', normalizeCurrency(str('currency')));
+  if (form.webhook_type !== undefined) {
+    await writeSetting(db, 'webhook_type', normalizeWebhookType(str('webhook_type')));
+  }
+
+  if (form.notify_days !== undefined) {
+    const daysRaw = str('notify_days');
+    if (!daysRaw) {
+      await deleteSetting(db, 'notify_days');
+    } else {
+      const parts = daysRaw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (!parts.length || !parts.every((p) => /^\d{1,4}$/.test(p))) {
+        return fail('提醒天数格式不正确，示例：30,7,1,0');
+      }
+      const normalized = Array.from(new Set(parts.map(Number)))
+        .sort((a, b) => b - a)
+        .join(',');
+      await writeSetting(db, 'notify_days', normalized);
+    }
+  }
+
+  // Webhook 地址在页面上是打码显示的，输入框留空表示「不改」，清除要勾下面的复选框
+  if (form.webhook_clear) {
+    await deleteSetting(db, 'webhook_url');
+  } else {
+    const url = str('webhook_url');
+    if (url) {
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return fail('Webhook 地址不是合法 URL');
+      }
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        return fail('Webhook 地址必须以 http(s):// 开头');
+      }
+      await writeSetting(db, 'webhook_url', url.slice(0, 500));
+    }
+  }
+
+  const next = str('new_password');
+  if (next) {
+    if (next.length < 8) return fail('新密码至少 8 位');
+    if (next !== str('confirm_password')) return fail('两次输入的新密码不一致');
+    if (material && !(await verifyPassword(settings, str('current_password')))) {
+      return fail('当前密码不正确');
+    }
+    await writeSetting(db, 'admin_password', await hashPassword(next));
+    // 签名密钥由密码派生，改完密码旧会话全部失效
+    c.header('Set-Cookie', clearCookie());
+    return c.redirect('/login?reset=1', 302);
+  }
+
+  return c.redirect('/settings?saved=1', 302);
 });
 
 app.get('/api/domains', async (c) => {
@@ -112,15 +224,25 @@ app.get('/api/domains', async (c) => {
 app.post('/api/domains', async (c) => {
   if (!csrfOk(c)) return c.json({ error: 'CSRF 校验失败' }, 403);
 
-  const body = await c.req.json<{ domain?: string; platform?: string; note?: string; autoRenew?: boolean }>();
+  const body = await c.req.json<{
+    domain?: string;
+    platform?: string;
+    note?: string;
+    autoRenew?: boolean;
+    cost?: unknown;
+  }>();
   const normalized = normalizeDomain(String(body.domain ?? ''));
   if (!normalized) return c.json({ error: '域名格式不正确' }, 400);
+
+  const cost = parseCostInput(body.cost);
+  if (cost.error) return c.json({ error: cost.error }, 400);
 
   const added = await addDomain(c.env.DB, {
     domain: normalized,
     platform: String(body.platform ?? '').slice(0, 60),
     note: String(body.note ?? '').slice(0, 200),
     autoRenew: Boolean(body.autoRenew),
+    cost: cost.value,
   });
   if (!added.ok) return c.json({ error: added.error }, 409);
 
@@ -142,7 +264,7 @@ app.post('/api/domains', async (c) => {
 app.post('/api/domains/bulk', async (c) => {
   if (!csrfOk(c)) return c.json({ error: 'CSRF 校验失败' }, 403);
 
-  const body = await c.req.json<{ items?: { domain?: string; platform?: string }[] }>();
+  const body = await c.req.json<{ items?: { domain?: string; platform?: string; cost?: unknown }[] }>();
   const items = Array.isArray(body.items) ? body.items.slice(0, 500) : [];
   let added = 0;
   const skipped: string[] = [];
@@ -153,9 +275,11 @@ app.post('/api/domains/bulk', async (c) => {
       skipped.push(String(item?.domain ?? '(空)'));
       continue;
     }
+    const cost = parseCostInput(item?.cost);
     const res = await addDomain(c.env.DB, {
       domain: normalized,
       platform: String(item?.platform ?? '').slice(0, 60),
+      cost: cost.value,
     });
     if (res.ok) added++;
     else skipped.push(normalized);
@@ -174,14 +298,24 @@ app.patch('/api/domains/:id', async (c) => {
     note?: string;
     autoRenew?: boolean;
     notify?: boolean;
+    cost?: unknown;
   }>();
+
+  let cost: number | null | undefined;
+  if (body.cost !== undefined) {
+    const parsed = parseCostInput(body.cost);
+    if (parsed.error) return c.json({ error: parsed.error }, 400);
+    cost = parsed.value;
+  }
+
   const ok = await updateDomain(c.env.DB, id, {
     ...(body.platform !== undefined ? { platform: String(body.platform).slice(0, 60) } : {}),
     ...(body.note !== undefined ? { note: String(body.note).slice(0, 200) } : {}),
     ...(body.autoRenew !== undefined ? { autoRenew: Boolean(body.autoRenew) } : {}),
     ...(body.notify !== undefined ? { notify: Boolean(body.notify) } : {}),
+    ...(cost !== undefined ? { cost } : {}),
   });
-  return ok ? c.json({ ok: true }) : c.json({ error: '未更新任何字段' }, 400);
+  return ok ? c.json({ ok: true, cost: cost ?? null }) : c.json({ error: '未更新任何字段' }, 400);
 });
 
 app.post('/api/domains/:id/refresh', async (c) => {
@@ -199,7 +333,7 @@ app.post('/api/domains/:id/refresh', async (c) => {
 /** 表单提交（非 fetch），所以用 csrf 隐藏字段而不是自定义请求头 */
 app.post('/api/domains/:id/delete', async (c) => {
   const form = await c.req.parseBody();
-  if (!timingSafeEqualStr(String(form.csrf ?? ''), await csrfToken(c.env))) {
+  if (!timingSafeEqualStr(String(form.csrf ?? ''), await csrfToken(signingMaterial(c.get('settings'))))) {
     return c.json({ error: 'CSRF 校验失败' }, 403);
   }
   const id = Number(c.req.param('id'));
@@ -246,11 +380,10 @@ function csrfOk(c: { req: { header: (name: string) => string | undefined } }): b
 }
 
 /** 由密码派生的固定 token；配合 SameSite=Lax，跨站请求既拿不到也发不出 */
-async function csrfToken(env: Env): Promise<string> {
-  const password = env.ADMIN_PASSWORD ?? 'unset';
+async function csrfToken(material: string | null): Promise<string> {
   const key = await crypto.subtle.importKey(
     'raw',
-    new TextEncoder().encode(password),
+    new TextEncoder().encode(material ?? 'unset'),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign']

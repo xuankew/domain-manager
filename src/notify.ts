@@ -1,21 +1,24 @@
-import type { Env } from './env';
-
 export interface NotifyResult {
   sent: boolean;
   error: string | null;
+}
+
+export interface WebhookTarget {
+  url: string;
+  type: string;
 }
 
 /**
  * 把一条到期提醒投递到 Webhook。
  * 支持钉钉 / 企业微信 / 飞书 / Slack 的字段格式，其余按 generic JSON 发送，
  * 方便接 n8n、ntfy 或自建接收端。
+ * 地址与类型由调用方从设置里解析好传入（D1 优先，env 兜底）。
  */
-export async function sendWebhook(env: Env, title: string, markdown: string): Promise<NotifyResult> {
-  const url = env.WEBHOOK_URL?.trim();
+export async function sendWebhook(target: WebhookTarget, title: string, markdown: string): Promise<NotifyResult> {
+  const url = target.url.trim();
   if (!url) return { sent: false, error: null }; // 未配置即静默跳过
 
-  const type = (env.WEBHOOK_TYPE ?? 'generic').trim().toLowerCase();
-  const body = buildPayload(type, title, markdown);
+  const body = buildPayload(target.type, title, markdown);
 
   try {
     const res = await fetch(url, {
@@ -37,10 +40,8 @@ function buildPayload(type: string, title: string, markdown: string): unknown {
     case 'dingtalk':
       return { msgtype: 'markdown', markdown: { title, text: `### ${title}\n${markdown}` } };
     case 'wecom':
-    case 'wechat':
       return { msgtype: 'markdown', markdown: { content: `### ${title}\n${markdown}` } };
     case 'feishu':
-    case 'lark':
       return { msg_type: 'text', content: { text: `${title}\n${stripMarkdown(markdown)}` } };
     case 'slack':
       return { text: `*${title}*\n${markdown}` };

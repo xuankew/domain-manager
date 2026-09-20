@@ -8,6 +8,7 @@ export interface DomainRow {
   note: string;
   auto_renew: number;
   notify: number;
+  cost: number | null;
   created_at: string;
   expires_at: string | null;
   registrar: string | null;
@@ -60,22 +61,30 @@ export async function getDomainByLabel(db: D1Database, domain: string): Promise<
 
 export async function addDomain(
   db: D1Database,
-  input: { domain: string; platform?: string; note?: string; autoRenew?: boolean; notify?: boolean }
+  input: {
+    domain: string;
+    platform?: string;
+    note?: string;
+    autoRenew?: boolean;
+    notify?: boolean;
+    cost?: number | null;
+  }
 ): Promise<{ ok: true; row: DomainRow } | { ok: false; error: string }> {
   const existing = await getDomainByLabel(db, input.domain);
   if (existing) return { ok: false, error: `${input.domain} 已在列表中` };
 
   await db
     .prepare(
-      `INSERT INTO domains (domain, platform, note, auto_renew, notify)
-       VALUES (?1, ?2, ?3, ?4, ?5)`
+      `INSERT INTO domains (domain, platform, note, auto_renew, notify, cost)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`
     )
     .bind(
       input.domain,
       input.platform ?? '',
       input.note ?? '',
       input.autoRenew ? 1 : 0,
-      input.notify === false ? 0 : 1
+      input.notify === false ? 0 : 1,
+      input.cost ?? null
     )
     .run();
 
@@ -95,10 +104,10 @@ export async function deleteDomain(db: D1Database, id: number): Promise<boolean>
 export async function updateDomain(
   db: D1Database,
   id: number,
-  patch: Partial<{ platform: string; note: string; autoRenew: boolean; notify: boolean }>
+  patch: Partial<{ platform: string; note: string; autoRenew: boolean; notify: boolean; cost: number | null }>
 ): Promise<boolean> {
   const sets: string[] = [];
-  const values: (string | number)[] = [];
+  const values: (string | number | null)[] = [];
   if (patch.platform !== undefined) {
     sets.push('platform = ?' + (values.length + 1));
     values.push(patch.platform);
@@ -114,6 +123,10 @@ export async function updateDomain(
   if (patch.notify !== undefined) {
     sets.push('notify = ?' + (values.length + 1));
     values.push(patch.notify ? 1 : 0);
+  }
+  if (patch.cost !== undefined) {
+    sets.push('cost = ?' + (values.length + 1));
+    values.push(patch.cost);
   }
   if (!sets.length) return false;
 
@@ -192,4 +205,62 @@ export async function isSchemaReady(db: D1Database): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * 已部署的旧库自动补上新表/新列，省掉手动迁移这一步。
+ * SQLite 的 ALTER TABLE ADD COLUMN 没有 IF NOT EXISTS，所以先用 PRAGMA 探测。
+ * 一个 isolate 生命周期内只检测一次。
+ */
+let upgrade: Promise<void> | null = null;
+
+export function ensureSchema(db: D1Database): Promise<void> {
+  if (!upgrade) {
+    upgrade = upgradeSchema(db).catch((err) => {
+      console.error('schema upgrade failed', err);
+    });
+  }
+  return upgrade;
+}
+
+async function upgradeSchema(db: D1Database): Promise<void> {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS settings (
+         key        TEXT PRIMARY KEY,
+         value      TEXT NOT NULL,
+         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+       )`
+    )
+    .run();
+
+  const info = await db.prepare('PRAGMA table_info(domains)').all<{ name: string }>();
+  const columns = (info.results ?? []).map((r) => r.name);
+  // columns 为空说明还没建过表，交给 schema.sql，别在这里 ALTER
+  if (columns.length && !columns.includes('cost')) {
+    await db.prepare('ALTER TABLE domains ADD COLUMN cost REAL').run();
+  }
+}
+
+export async function readSettings(db: D1Database): Promise<Map<string, string>> {
+  try {
+    const { results } = await db.prepare('SELECT key, value FROM settings').all<{ key: string; value: string }>();
+    return new Map((results ?? []).map((r) => [r.key, r.value]));
+  } catch {
+    return new Map(); // settings 表还不存在时退化为纯 env 配置
+  }
+}
+
+export async function writeSetting(db: D1Database, key: string, value: string): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    )
+    .bind(key, value)
+    .run();
+}
+
+export async function deleteSetting(db: D1Database, key: string): Promise<void> {
+  await db.prepare('DELETE FROM settings WHERE key = ?1').bind(key).run();
 }

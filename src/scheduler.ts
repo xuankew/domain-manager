@@ -1,6 +1,6 @@
 import type { Env } from './env';
-import { notifyThresholds } from './env';
-import { d1Cache, listDomains, saveLookup, toView, type DomainRow } from './db';
+import { formatMoney, loadSettings, type AppSettings } from './settings';
+import { d1Cache, listDomains, saveLookup, toView, type DomainRow, type DomainView } from './db';
 import { lookupDomain, type DomainLookup } from './lookup';
 import { sendWebhook } from './notify';
 
@@ -59,7 +59,7 @@ export async function refreshAll(env: Env): Promise<RefreshSummary> {
   });
   await Promise.all(workers);
 
-  const alert = await dispatchAlerts(env);
+  const alert = await dispatchAlerts(env, await loadSettings(env));
   summary.alerts = alert.sent;
   summary.notifyError = alert.error;
   summary.ms = Date.now() - started;
@@ -71,12 +71,16 @@ export async function refreshAll(env: Env): Promise<RefreshSummary> {
  * 只发“刚刚跨过的那一档”：daysLeft=25 触发 30 天档，daysLeft=5 触发 7 天档，
  * 而不是把所有满足 daysLeft <= threshold 的档位一次性全发出去。
  */
-export async function dispatchAlerts(env: Env): Promise<{ sent: number; error: string | null }> {
-  if (!env.WEBHOOK_URL?.trim()) return { sent: 0, error: null };
+async function dispatchAlerts(
+  env: Env,
+  settings: AppSettings
+): Promise<{ sent: number; error: string | null }> {
+  if (!settings.webhookUrl) return { sent: 0, error: null };
 
-  const thresholds = notifyThresholds(env).sort((a, b) => a - b);
+  const thresholds = [...settings.thresholds].sort((a, b) => a - b);
   const rows = await listDomains(env.DB);
   const lines: string[] = [];
+  const alerted: DomainView[] = [];
   const recorded: { domain: string; threshold: number; expiresAt: string }[] = [];
 
   for (const row of rows) {
@@ -95,7 +99,8 @@ export async function dispatchAlerts(env: Env): Promise<{ sent: number; error: s
       .first();
     if (already) continue;
 
-    lines.push(formatAlertLine(view, threshold));
+    lines.push(formatAlertLine(view, threshold, settings.currency));
+    alerted.push(view);
     recorded.push({ domain: row.domain, threshold, expiresAt: row.expires_at! });
   }
 
@@ -104,8 +109,11 @@ export async function dispatchAlerts(env: Env): Promise<{ sent: number; error: s
 
   if (!lines.length) return { sent: 0, error: null };
 
-  const title = `域名到期提醒（${lines.length} 条）`;
-  const res = await sendWebhook(env, title, lines.join('\n'));
+  const cost = renewalCost(alerted, settings.currency);
+  if (cost) lines.push(cost);
+
+  const title = `域名到期提醒（${recorded.length + failures.length} 条）`;
+  const res = await sendWebhook({ url: settings.webhookUrl, type: settings.webhookType }, title, lines.join('\n'));
 
   if (res.sent) {
     // 只有真正发出去才落去重记录，发送失败下次会重试
@@ -123,15 +131,27 @@ export async function dispatchAlerts(env: Env): Promise<{ sent: number; error: s
   return { sent: res.sent ? recorded.length + failures.length : 0, error: res.error };
 }
 
-function formatAlertLine(view: ReturnType<typeof toView>, threshold: number): string {
+function formatAlertLine(view: DomainView, threshold: number, currency: string): string {
   const date = (view.expires_at ?? '').slice(0, 10);
   const days = view.daysLeft!;
   const platform = view.platform ? `（${view.platform}）` : '';
   const renew = view.auto_renew ? ' · 已开自动续费' : '';
+  const cost = view.cost === null ? '' : ` · ${formatMoney(view.cost, currency)}/年`;
 
-  if (days < 0) return `🔴 **${view.domain}**${platform} 已过期 ${Math.abs(days)} 天（${date}）${renew}`;
-  if (days === 0) return `🔴 **${view.domain}**${platform} 今天到期（${date}）${renew}`;
-  return `🟡 **${view.domain}**${platform} 还剩 ${days} 天，${date} 到期${renew}`;
+  if (days < 0) return `🔴 **${view.domain}**${platform} 已过期 ${Math.abs(days)} 天（${date}）${renew}${cost}`;
+  if (days === 0) return `🔴 **${view.domain}**${platform} 今天到期（${date}）${renew}${cost}`;
+  return `🟡 **${view.domain}**${platform} 还剩 ${days} 天，${date} 到期${renew}${cost}`;
+}
+
+/** 本次提醒涉及域名的续费金额合计；一个成本都没填就不加这行 */
+function renewalCost(views: DomainView[], currency: string): string | null {
+  const priced = views.filter((v) => v.cost !== null);
+  if (!priced.length) return null;
+
+  const total = priced.reduce((sum, v) => sum + (v.cost ?? 0), 0);
+  const missing = views.length - priced.length;
+  const suffix = missing ? `（另有 ${missing} 个未填成本）` : '';
+  return `💰 续费合计约 **${formatMoney(total, currency)}**/年${suffix}`;
 }
 
 async function findPersistentFailures(
